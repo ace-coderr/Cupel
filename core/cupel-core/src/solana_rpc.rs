@@ -262,7 +262,7 @@ pub fn decode_lookup_table(data: &[u8]) -> Result<Vec<Pubkey>, String> {
     }
 
     let body = &data[LOOKUP_TABLE_META_SIZE..];
-    if body.len() % 32 != 0 {
+    if !body.len().is_multiple_of(32) {
         return Err(format!(
             "lookup table body is {} bytes, not a whole number of addresses",
             body.len()
@@ -585,3 +585,5 @@ mod tests {
         assert!(decode_transaction(&crate::message::base64_decode(&encoded).unwrap()).is_ok());
     }
 }
+
+

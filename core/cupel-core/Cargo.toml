@@ -2,6 +2,7 @@
 name = "cupel-core"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.87"
 license = "MIT OR Apache-2.0"
 description = "Solana transaction effect verification for wasm32-wasip2 agent plugins: decode, simulate, diff, and render what a transaction will actually do."
 repository = "https://github.com/ACE/cupel"
@@ -25,3 +26,4 @@ bs58 = { version = "0.5", default-features = false, features = ["alloc"] }
 [profile.release]
 opt-level = "s"
 lto = true
+
