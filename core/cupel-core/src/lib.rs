@@ -43,3 +43,5 @@ pub use token::{AccountState, Extension, ExtensionKind, Mint, TokenAccount};
 pub use transport::{MockTransport, Transport};
 pub mod solana_rpc;
 pub use solana_rpc::{decode_lookup_table, AccountSnapshot, RpcClient, SimulationResult};
+pub mod preflight;
+pub use preflight::preflight;
