@@ -2,46 +2,68 @@
 
 Read this before writing any code. The publicly published ZeroClaw docs
 describe a **different, older plugin ABI** than the one this project targets.
-Facts in this file were verified by reading the actual source of
-`zeroclaw-labs/zeroclaw` and `zeroclaw-labs/zeroclaw-plugins` at commit
-`e112ce6b5ccdac9e1cb166bab217e730dd7e24c2`. Where this file and any web
-documentation disagree, **this file wins**. If unsure, read the vendored source
-under `zeroclaw/` and `zeroclaw-plugins/` rather than guessing.
+Facts here were verified by reading the source of `zeroclaw-labs/zeroclaw` and
+`zeroclaw-labs/zeroclaw-plugins` at commit `e112ce6`, and by running the plugin
+on a real host against devnet. Where this file and any web documentation
+disagree, **this file wins**. If unsure, read the vendored source under
+`zeroclaw/` rather than guessing.
 
 ---
 
-## What we are building
+## What this is
 
-A Solana payment terminal for ZeroClaw where **every outbound transaction is
-simulation-verified before a human approves it**.
+A Solana transaction verifier for ZeroClaw agents. It simulates a transaction
+and reports its observed effect before a human approves it.
 
-The thesis, stated once: *the agent proposes, the simulation testifies, the
-human approves physics.*
+*The agent proposes, the simulation testifies, the human approves physics.*
 
-Every competing submission will have the human approving a description that the
-LLM wrote. Prompt-inject the agent and the approval card says "pay the supplier
-25 USDC" while the bytes underneath grant a delegate over the token account.
-Cupel closes that gap by simulating the transaction and reporting the observed
-effect instead of the claimed one.
-
-### Deliverables
-
-| Component | Tier | Purpose |
+| Component | Tier | Status |
 |---|---|---|
-| `cupel-core` | — | Published crates.io library: bs58, borsh, message codec, ALT resolution, JSON-RPC over `waki`, simulation decoding |
-| `solana-pay-request` | T1 | "charge table 4 for 25 USDC" → Solana Pay URL + reference key. Holds no secrets. |
-| `spl-transfer-build` | T1 | Unsigned versioned transfer, ATA handling, memo for reconciliation. Returns base64. |
-| `tx-preflight` | T1 | The verifier. Simulates a transaction, diffs balances and authorities, renders a verdict against a config-declared envelope. |
-
-Build order: spike → `cupel-core` → `tx-preflight` → `spl-transfer-build` →
-`solana-pay-request`. If time runs short, cut features from the builders. Never
-cut the verifier.
+| `cupel-core` | — | Published on crates.io, 85 tests |
+| `tx-preflight` | T1 | PR #137, 16 tests, all CI gates green |
+| `spl-transfer-build` | T1 | Optional, not built |
+| `solana-pay-request` | T1 | Optional, not built |
 
 ---
 
-## Verified facts about the plugin system
+## Running it — three undocumented prerequisites
 
-### The WIT contract
+Found by running the thing. None appear in any documentation.
+
+**1. The host needs a plugin-enabled build.** `plugins-wasm` is not a default
+feature, so a standard install has no `plugin` subcommand at all:
+
+```bash
+cargo build --release --features plugins-wasm-cranelift,channel-telegram
+```
+
+**2. Plugins are disabled by default.** Installing does not enable them, and
+`plugin install` gives no warning:
+
+```bash
+zeroclaw config set plugins.enabled true
+zeroclaw config set plugins.auto_discover true
+```
+
+**3. `https://` URLs need an explicit port — or normalising in code.** The
+scheme's default port does not survive `waki` → `wasi:http` →
+`default-send-request`, so requests dial 80 and are refused before TLS. It
+surfaces as `ErrorCode::ConnectionRefused`, that handler's catch-all, which is
+indistinguishable from the endpoint being down. `args.rs::normalise_https_port`
+handles it.
+
+Bisection that proved it: the same endpoint through the host's own
+`http_request` tool succeeds, so the fault is specific to the plugin sandbox.
+
+**Do not patch `WasiCtx` with `inherit_network()`.** An earlier attempt assumed
+the sandbox lacked sockets. It doesn't matter —
+`wasmtime-wasi-http` is pulled with `default-send-request`, which connects
+host-side and never consults the guest's WASI network capability. That patch
+was a no-op and has been reverted.
+
+---
+
+## The plugin ABI
 
 `wit/v0/tool.wit`, package `zeroclaw:plugin@0.1.0`:
 
@@ -53,181 +75,118 @@ world tool-plugin {
 }
 ```
 
-The `tool` interface exports exactly four functions — `name`, `description`,
-`parameters-schema`, `execute` — plus a `tool-result` record of
-`{ success: bool, output: string, error: option<string> }`. `plugin-info`
-exports `plugin-name` and `plugin-version`.
-
+Four exports: `name`, `description`, `parameters-schema`, `execute`, plus a
+`tool-result` of `{ success: bool, output: string, error: option<string> }`.
 Everything is gated behind `@unstable(feature = plugins-wit-v0)`, so
-`generate!` must pass that feature or the interfaces are invisible.
+`generate!` must pass that feature.
 
-`wit/v0/.frozen` **does not exist**. The ABI is experimental and may move.
-Pin the upstream ref in the README.
+`wit/v0/.frozen` does not exist. The ABI can still move.
 
-### HTTP is real but unprecedented
+### HTTP from a tool plugin
 
-The `tool-plugin` world does **not** declare a `wasi:http` import. HTTP is
-wired separately by the host, gated on the `http_client` permission:
+The `tool-plugin` world does not declare `wasi:http`. The host wires it
+separately, gated on `http_client`:
+`runtime.rs::create_plugin` calls `.with_granted_http()` and selects
+`tool_linker_http()`.
 
-- `crates/zeroclaw-plugins/src/component.rs` — `with_granted_http()` attaches a
-  `WasiHttpCtx` only when the scope grants `HttpClient`. There is a test named
-  `grant_does_not_enable_http_without_adapter_opt_in`: the permission alone is
-  not sufficient, the adapter must opt in.
-- `crates/zeroclaw-plugins/src/runtime.rs::create_plugin` — the **tool** path
-  calls `.with_granted_http()` and selects `tool_linker_http()` when the grant
-  is present.
+`tx-preflight` is the first tool plugin in the ecosystem to use it. All other
+HTTP plugins are channels. Use `waki`, as `plugins/telegram` does.
 
-So a tool plugin declaring `permissions = ["http_client"]` gets `wasi:http`.
+### `ToolResult.success` semantics
 
-**But**: `redact-text` is the only tool plugin in the entire repository, and it
-makes no network calls. All thirty other plugins are channels. No tool plugin
-has ever declared `http_client`. Expect untrodden bugs. The spike exists to
-prove this path before anything else is built.
+**A FAIL verdict must return `success: true`.** The host discards `output` and
+shows only `error` when `success: false`, which throws away the verdict block —
+the one thing the human needs to read. A negative verdict is a *successful*
+verification. The verdict word carries the decision.
 
-Use `waki` for HTTP, exactly as `plugins/telegram` does:
+### Config injection
 
-```rust
-waki::Client::new().post(url).json(body).send()
-    .map_err(|e| e.to_string())?
-    .json::<Value>().map_err(|e| e.to_string())
-```
+The host merges plugin config into `execute` args under `__config`, stripping
+any caller-supplied `__config` first, with upstream tests firing a forged
+section at it. Guardrails read from config are unreachable by prompt injection,
+guaranteed by the runtime rather than by our code.
 
-### Config injection — the security foundation
-
-The host merges the plugin's resolved config into `execute` args under a
-reserved `__config` key, **stripping any caller-supplied `__config` first so
-the section cannot be spoofed** (`runtime.rs`, with tests firing
-`{"prompt":"x","__config":{"api_key":"forged"}}` at it and asserting the
-forgery is discarded).
-
-This is why Cupel's guardrails actually hold: caps and allowlists read from
-`__config` are unreachable by prompt injection, guaranteed by the host rather
-than by our code. Cite this in the threat model.
-
-**Constraint:** `__config` deserializes as a flat `HashMap<String, String>`.
-No nesting. No numbers. Caps parse from strings; allowlists are
-comma-separated. Design every config key around that shape.
-
-### Limits
-
-1,000,000,000 fuel per call, 256 MB memory, 100,000 table elements, 64
-instances (`crates/zeroclaw-config/src/schema.rs`). Generous — decoding and
-simulation parsing are not a concern.
+`__config` deserialises as a flat `HashMap<String, String>` — no nesting, no
+numbers. Values are encrypted at rest as `enc2:` blobs and decrypted at call
+time.
 
 ### Logging
 
 Use the `logging` import's `log-record`, never stdout. `plugin-action` is a
-**closed enum** with no escape hatch. Relevant variants for us: `validate`,
-`approve`, `reject`, `defer`, `complete`, `fail`.
+closed enum; relevant variants: `validate`, `approve`, `reject`, `defer`,
+`complete`, `fail`.
 
 ---
 
-## What the CI gate actually runs
+## CI gates
 
-From `tools/ci/validate_components.sh`, per plugin, all with `--locked`:
+From `tools/ci/validate_components.sh`, per plugin, all `--locked`:
 
-1. `cargo test --locked`
-2. `cargo clippy --locked --all-targets -- -D warnings`
-3. `cargo clippy --locked --target wasm32-wasip2 -- -D warnings`
-4. `cargo build --locked --target wasm32-wasip2 --release`
+1. `cargo test`
+2. `cargo clippy --all-targets -- -D warnings`
+3. `cargo clippy --target wasm32-wasip2 -- -D warnings`
+4. `cargo build --target wasm32-wasip2 --release`
 
-For a plugin in the touched set, **clippy failures block the merge**. Zero
-warnings is the bar, not a nicety.
+Clippy failures block the merge. It also diffs the source tree before and after
+building, requires manifest `name` to equal the directory name, and requires
+`wasm_path` to equal the cargo output filename (hyphens become underscores).
 
-It also:
-
-- Diffs the source tree before and after building; a build that mutates its own
-  source fails.
-- Requires the artifact at
-  `$CARGO_TARGET_DIR/wasm32-wasip2/release/<wasm_path>` to exist and be
-  non-empty.
-- Requires manifest `name` to equal the plugin directory name exactly.
-- Validates `name` against `^[a-z0-9][a-z0-9_-]*$` and `wasm_path` against
-  `^[A-Za-z0-9][A-Za-z0-9_.-]*\.wasm$`.
-
-**`wasm_path` must equal the cargo output filename.** Crate `cupel-spike`
-produces `cupel_spike.wasm` — hyphens become underscores.
-
-**Commit `Cargo.lock`.** Every command uses `--locked` and will fail without it.
-
-### No path dependencies
-
-CI snapshots only `plugins/<name>` and `wit/v0` into a temp directory and
-builds there. A `path = "../../crates/cupel-core"` dependency points at a
-directory that will not exist in the snapshot, and the build fails. Every
-existing plugin is a standalone workspace with crates.io-only dependencies.
-
-Therefore **`cupel-core` is published to crates.io and imported by version.**
-This is better anyway: the Track E prize asks for a library other tracks
-actually import, and a published crate is importable by anyone.
+**Commit `Cargo.lock`. No path dependencies** — CI snapshots only
+`plugins/<name>` and `wit/v0`, so `cupel-core` is depended on by version from
+crates.io.
 
 ---
 
-## Coding conventions
+## Design rules
 
-Copied from `plugins/redact-text`, the canonical reference. Match it exactly.
-
-- `edition = "2021"`, `license = "MIT OR Apache-2.0"`, `publish = false` on
-  plugin crates (`cupel-core` publishes).
-- `crate-type = ["cdylib", "rlib"]`.
-- Empty `[workspace]` table at the bottom of every plugin `Cargo.toml` so cargo
-  does not search for a parent workspace.
-- `[profile.release]`: `opt-level = "s"`, `lto = true`, `strip = true`,
-  `codegen-units = 1`.
-- `waki` under `[target.'cfg(target_family = "wasm")'.dependencies]` so host
-  tests never try to compile it.
 - **Pure core, thin shim.** All logic in a plain Rust module with no wasm
-  dependency. The component is a `#[cfg(target_family = "wasm")] mod component`
-  that calls into it.
-- `wit_bindgen::generate!({ path: "../../wit/v0", world: "tool-plugin",
-  features: ["plugins-wit-v0"] })` — the path is relative, so plugins must live
-  inside a checkout of `zeroclaw-plugins`.
-
-### Behavioural rules
-
-- **Fail closed.** Any decode failure, simulation error, unresolvable lookup
-  table, or unexpected shape returns an error verdict, never a permissive one.
-  Silence is not consent.
-- **Shape the output.** A raw simulation response would nuke the agent's
-  context and cost the operator money on every call. Target ≤160 tokens from
-  `execute`. Judges will call it and count. Put the number in the README.
-- **Never hold a private key.** All components are T0/T1. If a design pressures
-  you toward T2, stop and reconsider.
+  dependency; the component is a `#[cfg(target_family = "wasm")]` shim.
+- **Fail closed.** Decode failure, simulation error, unresolvable lookup table,
+  malformed config, a transaction that wouldn't land, and an owner mismatch all
+  produce `FAIL`. No permissive default anywhere.
+- **No floats.** `u128` base units with explicit decimals.
+- **Shape the output.** ≤160 tokens from `execute`. Judges count.
+- **Never claim safety.** A pass reads `Effects match your limits.`, never
+  "safe to sign".
 - **Mock the RPC in tests.** No live network in `cargo test`.
 
+### The owner-mismatch trap
+
+If a transaction touches no account belonging to the configured wallet, there
+is nothing to check against the operator's limits. A naive implementation finds
+no outflows, no violations, and reports PASS on a transaction it never
+examined — so a typo in `owner_pubkey` becomes a rubber stamp. `preflight.rs`
+tracks `touched_owner_account` and refuses. Found by running it with the wrong
+key configured.
+
 ---
 
-## Traps
+## Traps still open
 
-1. **Blockhash expiry.** A transaction sitting in an approval queue dies in
-   about a minute. Our answer: approval binds to the *verified effect plus
-   reference*, not the bytes. On rebuild, re-simulate; identical effect means
-   the approval carries, any drift means re-ask. Document durable nonce
-   accounts as the v2 alternative.
-2. **`solana-sdk` and `solana-client` will not compile** for wasm32-wasip2
-   inside a WIT component. Assemble with `bs58`, `borsh`, and hand-rolled
-   instruction encoding. Document everything that fought you — the bounty says
-   that write-up is worth points.
-3. **Address lookup tables.** v0 transactions need an extra `getAccountInfo`
-   round-trip to resolve. Token-2022 accounts append extensions after the
-   165-byte base layout. Budget two days for the decoder; it is the part
-   nobody else will get right.
-4. **Do not read the published plugin-protocol docs.** They describe an Extism
-   ABI with `wasm32-wasip1`, `extism-pdk`, `tool_metadata`, and
-   `zc_http_request`. None of that applies here.
+**Blockhash expiry.** A transaction in an approval queue dies in about a
+minute. The answer here: approval binds to the verified *effect* (`EFX`, a
+digest over amounts, grants, closes, counterparty, reference), not the bytes.
+On rebuild, re-simulate; identical digest means the approval carries. Durable
+nonce accounts are the v2 alternative.
+
+**The relay hole.** `execute` returns to the model, and the model decides what
+reaches the human. An injected model could paraphrase a FAIL. Mitigated by the
+`description()` relay instruction, the distinctive fixed format, and ZeroClaw's
+HMAC tool receipts — but closing it properly needs a host-side render path for
+tool output.
 
 ---
 
 ## Definition of done for any component
 
-- [ ] Pure core with no wasm dependency, host-tested with mocked RPC
+- [ ] Pure core, host-tested with mocked RPC
 - [ ] `cargo test` passes with no wasm toolchain installed
 - [ ] Both clippy gates pass with `-D warnings`
 - [ ] Builds for `wasm32-wasip2 --release`, artifact name matches `wasm_path`
-- [ ] `Cargo.lock` committed
-- [ ] `manifest.toml`: name matches directory, minimal permissions, description
-      says what it does
-- [ ] `README.md`: purpose, config keys, custody tier, threat model, one worked
+- [ ] `Cargo.lock` committed, no path dependencies
+- [ ] `manifest.toml`: name matches directory, minimal permissions
+- [ ] `README.md`: purpose, config keys, custody tier, threat model, worked
       example, token count
-- [ ] A prompt-injection test that fails closed, transcript in the README
+- [ ] A prompt-injection transcript that fails closed
 - [ ] Structured logging via `log-record`, never stdout
+- [ ] Verified on a real host, not just in tests
