@@ -127,6 +127,8 @@ fn run<T: Transport>(
         return Err("simulation returned no account states to compare".to_string());
     }
 
+    let fee = fee_for_transaction(transport, rpc_url, transaction_base64).unwrap_or(0);
+
     let findings = diff(
         &client,
         message,
@@ -135,7 +137,7 @@ fn run<T: Transport>(
         &simulation.accounts,
         envelope,
         owner,
-        fee_for_message(transport, rpc_url, transaction_base64).unwrap_or(0),
+        fee,
     )?;
 
     Ok(Report::verified(
@@ -146,20 +148,54 @@ fn run<T: Transport>(
     ))
 }
 
+/// Strip the signature envelope so only the message remains, base64-encoded.
+///
+/// `getFeeForMessage` wants a *message*, not a transaction; handed a whole
+/// transaction it returns null and the fee silently reads as zero.
+fn message_base64(transaction_base64: &str) -> Option<String> {
+    let bytes = crate::message::base64_decode(transaction_base64.trim()).ok()?;
+
+    // compact-u16 signature count, then 64 bytes per signature.
+    let mut pos = 0usize;
+    let mut count = 0usize;
+    let mut shift = 0u32;
+    loop {
+        let byte = *bytes.get(pos)?;
+        pos += 1;
+        count |= ((byte & 0x7f) as usize) << shift;
+        if byte & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+        if shift > 21 {
+            return None;
+        }
+    }
+
+    let start = pos.checked_add(count.checked_mul(64)?)?;
+    let message = bytes.get(start..)?;
+    if message.is_empty() {
+        return None;
+    }
+    Some(crate::message::base64_encode(message))
+}
+
 /// Ask what this message will cost in fees.
 ///
 /// Best effort: a fee we cannot fetch is displayed as zero rather than
 /// blocking a verdict, because the fee is never the thing that drains a wallet.
-fn fee_for_message<T: Transport>(
+fn fee_for_transaction<T: Transport>(
     transport: &T,
     rpc_url: &str,
     transaction_base64: &str,
 ) -> Option<u64> {
+    let message = message_base64(transaction_base64)?;
+
     let body = json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "getFeeForMessage",
-        "params": [transaction_base64, { "commitment": "confirmed" }],
+        "params": [message, { "commitment": "confirmed" }],
     })
     .to_string();
 
@@ -190,12 +226,19 @@ fn diff<T: Transport>(
     let mut sol_delta: i128 = 0;
     let mut counterparty: Option<Counterparty> = None;
 
+    // Did this transaction touch anything the configured owner controls? A
+    // transaction that touches none of their accounts cannot be judged against
+    // their limits, and saying so is the difference between a verifier and a
+    // rubber stamp. See the check after this loop.
+    let mut touched_owner_account = false;
+
     for (position, address) in watched.iter().enumerate() {
         let pre = before.get(position).and_then(Option::as_ref);
         let post = after.get(position).and_then(Option::as_ref);
 
         // Native SOL: the operator's own account.
         if *address == owner {
+            touched_owner_account = true;
             let pre_lamports = pre.map_or(0i128, |a| i128::from(a.lamports));
             let post_lamports = post.map_or(0i128, |a| i128::from(a.lamports));
             sol_delta += post_lamports - pre_lamports;
@@ -214,6 +257,9 @@ fn diff<T: Transport>(
         };
 
         let ours = pre_token.owner == owner;
+        if ours {
+            touched_owner_account = true;
+        }
 
         let Some(post) = post else {
             if ours {
@@ -279,6 +325,18 @@ fn diff<T: Transport>(
                 known: false,
             });
         }
+    }
+
+    // A misconfigured `owner_pubkey` would otherwise sail through: no accounts
+    // match, so no outflows are found, so nothing violates the envelope, and
+    // the verdict reads PASS on a transaction nobody actually checked. A typo
+    // must not become a rubber stamp.
+    if !touched_owner_account {
+        return Err(
+            "transaction touches no account owned by the configured wallet, so there is \
+             nothing to check against your limits: verify owner_pubkey"
+                .to_string(),
+        );
     }
 
     // Decimals come from the mints themselves; there is no other honest source.
@@ -496,7 +554,6 @@ mod tests {
     fn transaction(our_token_account: Pubkey) -> String {
         let mut msg = Vec::new();
         msg.extend([1, 0, 1]); // 1 signer, 1 readonly unsigned (the program)
-        msg.extend(crate::message::base64_decode("").unwrap()); // no-op, keeps shape clear
         let keys = [key(1), our_token_account, token_program()];
         msg.extend([keys.len() as u8]);
         for k in keys {
@@ -631,6 +688,39 @@ mod tests {
     }
 
     #[test]
+    fn a_wrong_owner_is_unverifiable_not_a_clean_pass() {
+        // The dangerous case: a typo in `owner_pubkey` means no account
+        // matches, no outflow is found, nothing violates the envelope, and a
+        // naive implementation reports PASS on a transaction it never checked.
+        let before = account_json(
+            token_program(),
+            &token_account(usdc_mint(), key(1), 100_000_000, None),
+        );
+        let after = account_json(
+            token_program(),
+            &token_account(usdc_mint(), key(1), 75_000_000, None),
+        );
+
+        let transport = Scripted::new(vec![
+            ("getMultipleAccounts", value(&[account_json(Pubkey([0u8; 32]), &[]), before])),
+            ("simulateTransaction", simulation(&[account_json(Pubkey([0u8; 32]), &[]), after])),
+        ]);
+
+        let report = preflight(
+            &transport,
+            "https://ignored",
+            &transaction(key(0x21)),
+            &envelope(&[("max_out_per_mint", &format!("{USDC}:50.00"))]),
+            key(0x77), // nobody in this transaction
+        );
+
+        assert_eq!(report.verdict(), Verdict::Fail);
+        let out = report.render();
+        assert!(out.contains("could not verify"), "{out}");
+        assert!(out.contains("owner_pubkey"), "{out}");
+    }
+
+    #[test]
     fn an_unreachable_rpc_is_unverifiable_not_permissive() {
         struct Dead;
         impl Transport for Dead {
@@ -722,6 +812,38 @@ mod tests {
             .message;
         assert_eq!(extract_memo(&message), None);
     }
+
+    #[test]
+    fn the_fee_lookup_strips_the_signature_envelope() {
+        // getFeeForMessage wants a message; handed a whole transaction it
+        // returns null and the fee silently reads as zero.
+        let tx = transaction(key(0x21));
+        let msg = message_base64(&tx).expect("a valid transaction yields a message");
+        assert_ne!(msg, tx, "the signature envelope must be stripped");
+
+        let decoded = crate::message::base64_decode(&msg).unwrap();
+        assert!(
+            crate::message::decode_message(&decoded).is_ok(),
+            "what is left must parse as a message on its own"
+        );
+    }
+
+    #[test]
+    fn the_fee_lookup_handles_a_signed_transaction() {
+        let mut bytes = vec![1u8];
+        bytes.extend([7u8; 64]);
+        let inner = crate::message::base64_decode(&transaction(key(0x21))).unwrap();
+        bytes.extend(&inner[1..]); // skip the empty signature count
+        let encoded = base64_encode(&bytes);
+
+        let msg = message_base64(&encoded).expect("a signed transaction yields a message");
+        let decoded = crate::message::base64_decode(&msg).unwrap();
+        assert!(crate::message::decode_message(&decoded).is_ok());
+    }
+
+    #[test]
+    fn the_fee_lookup_refuses_junk() {
+        assert_eq!(message_base64("not base64!!"), None);
+        assert_eq!(message_base64(""), None);
+    }
 }
-
-
