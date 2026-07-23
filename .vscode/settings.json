@@ -1,0 +1,11 @@
+{
+  "rust-analyzer.linkedProjects": [
+    "core/cupel-core/Cargo.toml",
+    "zeroclaw-plugins/plugins/tx-preflight/Cargo.toml"
+  ],
+  "rust-analyzer.files.excludeDirs": ["zeroclaw", "zeroclaw-plugins/plugins"],
+  "files.watcherExclude": {
+    "**/target/**": true,
+    "**/zeroclaw/**": true
+  }
+}
